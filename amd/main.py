@@ -1,72 +1,111 @@
-"""ir_example/main.py
+"""main.py
 
-演示用 ctypes 从 Python 调用 HIP 共享库里的 host 函数，
-host 函数内部启动 GPU kernel。
+对应 nccl4py/examples/cute/main.py 的 main() 函数。
 
-三层结构：
+三层调用链：
   Python (main.py)
-    → ctypes 加载 ir_example.so，调用 scale()
-      → host 函数 scale()   [C++, CPU 上执行]
-        → hipMalloc / hipMemcpy
-        → scale_kernel<<<>>>  [GPU kernel, GPU 上执行]
-        → hipMemcpy 结果回 host
-    ← 返回结果给 Python
+    ├── ctypes → libscale_host.so   host API（分配 GPU 内存、上传数据）
+    └── kernel.run()                CuTeDSL kernel launch
+          └── scale_kernel          GPU kernel（通过 libscale_device.bc 的 FFI）
+
+完整数据流：
+  numpy src  →[H2D]→ GPU src_buf
+  ScaleCtx   →[H2D]→ GPU ctx
+  scale_kernel<<<>>>  →  GPU dst_buf
+  GPU dst_buf →[D2H]→ numpy dst  →  验证
 """
 
+import sys
 import ctypes
 import pathlib
-import sys
 import numpy as np
 
-# ─────────────────────────────────────────────
-# 第三层：Python 侧
-# ─────────────────────────────────────────────
+# ── 加载 host 共享库（对应 nccl4py 里 _nccl_bindings = nccl.bindings.nccl） ──
+_HERE = pathlib.Path(__file__).parent
+_lib  = ctypes.CDLL(str(_HERE / "libscale_host.so"))
 
-# 1. 加载共享库（等价于 ctypes.dlopen）
-so_path = pathlib.Path(__file__).parent / "ir_example.so"
-if not so_path.exists():
-    print(f"ERROR: {so_path} not found. Run build.sh first.")
-    sys.exit(1)
+# 声明函数签名（对应 nccl.pyx 里的 cpdef 包装）
+_lib.scale_ctx_create.argtypes  = [ctypes.c_float, ctypes.c_int]
+_lib.scale_ctx_create.restype   = ctypes.c_longlong
 
-lib = ctypes.CDLL(str(so_path))
+_lib.scale_ctx_destroy.argtypes = [ctypes.c_longlong]
+_lib.scale_ctx_destroy.restype  = None
 
-# 2. 声明函数签名（告诉 ctypes 参数类型和返回类型）
-#    int scale(const float* host_in, float* host_out, float scalar, int n)
-lib.scale.argtypes = [
-    ctypes.POINTER(ctypes.c_float),  # host_in
-    ctypes.POINTER(ctypes.c_float),  # host_out
-    ctypes.c_float,                  # scalar
-    ctypes.c_int,                    # n
+_lib.scale_buf_alloc.argtypes   = [ctypes.c_int]
+_lib.scale_buf_alloc.restype    = ctypes.c_longlong
+
+_lib.scale_buf_free.argtypes    = [ctypes.c_longlong]
+_lib.scale_buf_free.restype     = None
+
+_lib.scale_buf_copy_h2d.argtypes = [
+    ctypes.c_longlong,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_int,
 ]
-lib.scale.restype = ctypes.c_int
+_lib.scale_buf_copy_h2d.restype  = None
 
-# 3. 准备数据
-N = 1024
-scalar = 3.0
+_lib.scale_buf_copy_d2h.argtypes = [
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_longlong,
+    ctypes.c_int,
+]
+_lib.scale_buf_copy_d2h.restype  = None
 
-src = np.arange(N, dtype=np.float32)          # [0, 1, 2, ..., 1023]
-dst = np.zeros(N, dtype=np.float32)
+_lib.scale_sync.argtypes = []
+_lib.scale_sync.restype  = None
 
-# 4. 调用 host 函数（内部会启动 GPU kernel）
-ret = lib.scale(
-    src.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-    dst.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-    ctypes.c_float(scalar),
-    ctypes.c_int(N),
-)
 
-if ret != 0:
-    print("ERROR: scale() returned", ret)
-    sys.exit(1)
+def main():
+    N      = 1024
+    SCALAR = 3.0
 
-# 5. 验证结果
-expected = src * scalar
-if np.allclose(dst, expected):
-    print(f"[SUCCESS] scale({N} elements, scalar={scalar})")
-    print(f"  src[:4]      = {src[:4].tolist()}")
-    print(f"  dst[:4]      = {dst[:4].tolist()}")
-    print(f"  expected[:4] = {expected[:4].tolist()}")
-else:
-    mismatches = int((dst != expected).sum())
-    print(f"[ERROR] {mismatches}/{N} mismatches")
-    sys.exit(1)
+    # ── 准备 host 数据 ──────────────────────────────────────────────────────
+    src_np = np.arange(N, dtype=np.float32)
+    dst_np = np.zeros(N, dtype=np.float32)
+
+    # ── 分配 GPU 资源（对应 create_dev_comm + register_window） ────────────
+    ctx_ptr = _lib.scale_ctx_create(ctypes.c_float(SCALAR), ctypes.c_int(N))
+    src_ptr = _lib.scale_buf_alloc(ctypes.c_int(N))
+    dst_ptr = _lib.scale_buf_alloc(ctypes.c_int(N))
+    assert ctx_ptr and src_ptr and dst_ptr, "GPU alloc failed"
+
+    # ── host → device ──────────────────────────────────────────────────────
+    _lib.scale_buf_copy_h2d(
+        src_ptr,
+        src_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        N,
+    )
+
+    # ── 启动 CuTeDSL kernel（对应 test_nccl_put(dev_comm.ptr, ...)） ───────
+    import kernel
+    kernel.run(int(ctx_ptr), int(src_ptr), int(dst_ptr), N)
+
+    # ── 等待 + device → host ───────────────────────────────────────────────
+    _lib.scale_sync()
+    _lib.scale_buf_copy_d2h(
+        dst_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        dst_ptr,
+        N,
+    )
+
+    # ── 释放 GPU 资源（对应 dev_comm.close() + win.close()） ───────────────
+    _lib.scale_buf_free(dst_ptr)
+    _lib.scale_buf_free(src_ptr)
+    _lib.scale_ctx_destroy(ctx_ptr)
+
+    # ── 验证 ────────────────────────────────────────────────────────────────
+    expected = src_np * SCALAR
+    if np.allclose(dst_np, expected):
+        print(f"[SUCCESS] scale({N} elems, scalar={SCALAR})")
+        print(f"  src[:4]      = {src_np[:4].tolist()}")
+        print(f"  dst[:4]      = {dst_np[:4].tolist()}")
+        print(f"  expected[:4] = {expected[:4].tolist()}")
+        return 0
+    else:
+        bad = int((dst_np != expected).sum())
+        print(f"[ERROR] {bad}/{N} mismatches")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
